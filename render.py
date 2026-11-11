@@ -131,12 +131,88 @@ def cover(photo_path, box_w, box_h):
     return im.crop((left, top, left + box_w, top + box_h))
 
 
+def measure_header(d, spec):
+    """Lay the header text out without drawing it, so a photo scrim can be sized
+    before anything is painted on top."""
+    f_head = font(46, 700)
+    f_sub = font(21, 500)
+    head = wrap(d, spec["headline"], f_head, W - 2 * 130)
+    accent = (
+        wrap(d, spec["headline_accent"], f_head, W - 2 * 130)
+        if spec.get("headline_accent")
+        else []
+    )
+    sub = wrap(d, spec["subline"], f_sub, W - 2 * 140)
+    y = 146 + int(f_head.size * 1.18) * (len(head) + len(accent)) + 8
+    y += int(f_sub.size * 1.35) * len(sub)
+    return f_head, head, accent, f_sub, sub, y
+
+
+def apply_scrim(img, solid_to, fade_to):
+    """Lay navy over the top of a full bleed photo: solid behind the header text,
+    then eased away, so the header and the photograph read as one image."""
+    overlay = Image.new("RGBA", (W, fade_to), (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
+    for y in range(fade_to):
+        if y <= solid_to:
+            a = 255
+        else:
+            t = (y - solid_to) / max(fade_to - solid_to, 1)
+            a = int(255 * (1 - t) ** 2.2)
+        d.line([(0, y), (W, y)], fill=NAVY_TOP + (a,))
+    img.alpha_composite(overlay, (0, 0))
+
+
+def contrast(fg, bg):
+    def lin(c):
+        c = c / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    def lum(c):
+        r, g, b = (lin(x) for x in c[:3])
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    a, b = lum(fg), lum(bg)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def worst_contrast(img, top, bottom, fg):
+    """Lowest contrast between fg and the brightest pixel in a band."""
+    band = img.convert("RGB").crop((0, max(top, 0), W, min(bottom, H)))
+    small = band.resize((band.width // 4 or 1, band.height // 4 or 1))
+    worst = 99.0
+    for px in list(small.getdata()):
+        worst = min(worst, contrast(fg, px))
+    return round(worst, 2)
+
+
+FOOTER_BAND = 96
+
+
 def render(spec, out_path):
     report = {"size": [W, H], "checks": []}
-    img = background()
-    d = ImageDraw.Draw(img)
+    photo_layout = spec["layout"] == "photo"
 
-    # top rule
+    if photo_layout:
+        img = cover(spec["photo"], W, H).convert("RGBA")
+    else:
+        img = background().convert("RGBA")
+
+    d = ImageDraw.Draw(img)
+    f_head, head, accent, f_sub, sub, header_bottom = measure_header(d, spec)
+
+    if photo_layout:
+        apply_scrim(img, header_bottom - 26, header_bottom + 190)
+        d = ImageDraw.Draw(img)
+
+    # keep the background as it stands, before any text, to measure contrast against
+    backdrop = img.copy()
+    db = ImageDraw.Draw(backdrop)
+    if photo_layout:
+        db.rectangle([0, H - FOOTER_BAND, W, H], fill=NAVY_TOP)
+
+    # top rule, full width
     d.rectangle([0, 0, W, 5], fill=TEAL)
 
     # wordmark
@@ -144,48 +220,41 @@ def render(spec, out_path):
     draw_tracked(d, (W / 2, 34), "BLUEVOLTMARINE", f_mark, WHITE, tracking=8, anchor_mid=True)
     d.rectangle([W / 2 - 56, 78, W / 2 + 56, 80], fill=TEAL)
 
-    # eyebrow with a short rule either side
+    # eyebrow between two short rules
     f_eye = font(16, 600)
-    eyebrow = spec["eyebrow"].upper()
-    ew = draw_tracked(d, (W / 2, 102), eyebrow, f_eye, TEAL, tracking=6, anchor_mid=True)
+    ew = draw_tracked(
+        d, (W / 2, 102), spec["eyebrow"].upper(), f_eye, TEAL, tracking=6, anchor_mid=True
+    )
     for sign in (-1, 1):
         x0 = W / 2 + sign * (ew / 2 + 18)
         x1 = x0 + sign * 30
         d.line([min(x0, x1), 110, max(x0, x1), 110], fill=TEAL, width=2)
 
-    # headline
     y = 146
-    f_head = font(46, 700)
-    head_w = W - 2 * 130
-    for line in wrap(d, spec["headline"], f_head, head_w):
+    for line in head:
         d.text((W / 2, y), line, font=f_head, fill=WHITE, anchor="ma")
         y += int(f_head.size * 1.18)
-    if spec.get("headline_accent"):
-        for line in wrap(d, spec["headline_accent"], f_head, head_w):
-            d.text((W / 2, y), line, font=f_head, fill=TEAL_BRIGHT, anchor="ma")
-            y += int(f_head.size * 1.18)
-
-    # sub-line
+    for line in accent:
+        d.text((W / 2, y), line, font=f_head, fill=TEAL_BRIGHT, anchor="ma")
+        y += int(f_head.size * 1.18)
     y += 8
-    f_sub = font(21, 500)
-    for line in wrap(d, spec["subline"], f_sub, W - 2 * 140):
+    for line in sub:
         d.text((W / 2, y), line, font=f_sub, fill=SLATE, anchor="ma")
         y += int(f_sub.size * 1.35)
 
-    header_bottom = y
-    footer_rule_y = H - 84
-    avail_top = header_bottom + 26
-    avail_bottom = footer_rule_y - 26
-
-    if spec["layout"] == "photo":
-        box = (SIDE // 2, avail_top, W - SIDE // 2, avail_bottom)
-        ph = cover(spec["photo"], box[2] - box[0], box[3] - box[1])
-        img.paste(ph, (box[0], box[1]))
-        report["checks"].append(
-            {"photo_box": list(box), "text_over_photo": False}
-        )
+    if photo_layout:
+        # footer band, full width, sitting on the photo
+        band_top = H - FOOTER_BAND
+        d.rectangle([0, band_top, W, H], fill=NAVY_TOP)
+        d.rectangle([0, band_top - 3, W, band_top], fill=TEAL)
+        report["checks"].append({"full_bleed": True, "footer_band": FOOTER_BAND})
         report["balance"] = {"above": 0, "below": 0}
+        foot_y = band_top + 34
+        foot_rule_y = None
     else:
+        footer_rule_y = H - 84
+        avail_top = header_bottom + 26
+        avail_bottom = footer_rule_y - 26
         blocks = measure_items(d, spec)
         total = sum(b["h"] for b in blocks) + 22 * (len(blocks) - 1)
         space = avail_bottom - avail_top
@@ -199,22 +268,37 @@ def render(spec, out_path):
         for i, b in enumerate(blocks):
             draw_block(d, b, yy, i)
             yy += b["h"] + 22
+        d.rectangle([SIDE, footer_rule_y, W - SIDE, footer_rule_y + 2], fill=TEAL)
+        foot_y = H - 52
+        foot_rule_y = footer_rule_y
 
-    # footer
-    d.rectangle([SIDE, footer_rule_y, W - SIDE, footer_rule_y + 2], fill=TEAL)
     f_foot = font(20, 600)
     domain = spec.get("domain", "bluevoltmarine.com")
     draw_tracked(
         d,
-        (W / 2, H - 52),
-        f"{spec['cta']}  ·  {domain}",
+        (W / 2, foot_y),
+        f"{spec['cta']}  \u00b7  {domain}",
         f_foot,
         NEAR_WHITE,
         tracking=3,
         anchor_mid=True,
     )
 
-    img.save(out_path)
+    out = img.convert("RGB")
+
+    # every text band has to clear 4.5:1 against whatever ended up behind it
+    bg = backdrop.convert("RGB")
+    worst = min(
+        worst_contrast(bg, 28, 120, WHITE),
+        worst_contrast(bg, 140, header_bottom, WHITE),
+        worst_contrast(bg, foot_y - 6, foot_y + 28, NEAR_WHITE),
+    )
+    report["checks"].append({"lowest_contrast": worst, "passes": worst >= 4.5})
+    if worst < 4.5:
+        print(json.dumps(report))
+        sys.exit(1)
+
+    out.save(out_path)
     report["checks"].append({"within_safe_margin": True, "safe_margin": SAFE})
     report["out"] = out_path
     print(json.dumps(report))
